@@ -1,0 +1,2318 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>ДИЗАЙНЕР — Pitch</title>
+<script>
+/**
+ * <deck-stage> — reusable web component for HTML decks.
+ *
+ * Handles:
+ *  (a) speaker notes — reads <script type="application/json" id="speaker-notes">
+ *      and posts {slideIndexChanged: N} to the parent window on nav.
+ *  (b) keyboard navigation — ←/→, PgUp/PgDn, Space, Home/End, number keys.
+ *  (c) press R to reset to slide 0 (with a tasteful keyboard hint).
+ *  (d) bottom-center overlay showing slide count + hints, fades out on idle.
+ *  (e) auto-scaling — inner canvas is a fixed design size (default 1920×1080)
+ *      scaled with `transform: scale()` to fit the viewport, letterboxed.
+ *      Set the `noscale` attribute to render at authored size (1:1) — the
+ *      PPTX exporter sets this so its DOM capture sees unscaled geometry.
+ *  (f) print — `@media print` lays every slide out as its own page at the
+ *      design size, so the browser's Print → Save as PDF produces a clean
+ *      one-page-per-slide PDF with no extra setup.
+ *
+ * Slides are HIDDEN, not unmounted. Non-active slides stay in the DOM with
+ * `visibility: hidden` + `opacity: 0`, so their state (videos, iframes,
+ * form inputs, React trees) is preserved across navigation.
+ *
+ * Lifecycle event — the component dispatches a `slidechange` CustomEvent on
+ * itself whenever the active slide changes (including the initial mount).
+ * The event bubbles and composes out of shadow DOM, so you can listen on
+ * the <deck-stage> element or on document:
+ *
+ *   document.querySelector('deck-stage').addEventListener('slidechange', (e) => {
+ *     e.detail.index         // new 0-based index
+ *     e.detail.previousIndex // previous index, or -1 on init
+ *     e.detail.total         // total slide count
+ *     e.detail.slide         // the new active slide element
+ *     e.detail.previousSlide // the prior slide element, or null on init
+ *     e.detail.reason        // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+ *   });
+ *
+ * Persistence: current slide index is saved to localStorage keyed by the
+ * document path, so refresh returns you to the same place.
+ *
+ * Usage:
+ *   <deck-stage width="1920" height="1080">
+ *     <section data-label="Title">...</section>
+ *     <section data-label="Agenda">...</section>
+ *   </deck-stage>
+ *
+ * Slides are the direct element children of <deck-stage>. Each slide is
+ * automatically tagged with:
+ *   - data-screen-label="NN Label"   (1-indexed, for comment flow)
+ *   - data-om-validate="no_overflowing_text,no_overlapping_text,slide_sized_text"
+ */
+
+(() => {
+  const DESIGN_W_DEFAULT = 1920;
+  const DESIGN_H_DEFAULT = 1080;
+  const STORAGE_PREFIX = 'deck-stage:slide:';
+  const OVERLAY_HIDE_MS = 1800;
+  const VALIDATE_ATTR = 'no_overflowing_text,no_overlapping_text,slide_sized_text';
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+
+  const stylesheet = `
+    :host {
+      position: fixed;
+      inset: 0;
+      display: block;
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+
+    .stage {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .canvas {
+      position: relative;
+      transform-origin: center center;
+      flex-shrink: 0;
+      background: #fff;
+      will-change: transform;
+    }
+
+    /* Slides live in light DOM (via <slot>) so authored CSS still applies.
+       We absolutely position each slotted child to stack them. */
+    ::slotted(*) {
+      position: absolute !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      box-sizing: border-box !important;
+      overflow: hidden;
+      opacity: 0;
+      pointer-events: none;
+      visibility: hidden;
+    }
+    ::slotted([data-deck-active]) {
+      opacity: 1;
+      pointer-events: auto;
+      visibility: visible;
+    }
+
+    /* Tap zones for mobile — back/forward thirds like Stories.
+       Transparent, no visible UI, don't block the overlay. */
+    .tapzones {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      z-index: 2147482000;
+      pointer-events: none;
+    }
+    .tapzone {
+      flex: 1;
+      pointer-events: auto;
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* Only activate tap zones on coarse pointers (touch devices). */
+    @media (hover: hover) and (pointer: fine) {
+      .tapzones { display: none; }
+    }
+
+    .overlay {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translate(-50%, 6px) scale(0.92);
+      filter: blur(6px);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px;
+      background: #000;
+      color: #fff;
+      border-radius: 999px;
+      font-size: 12px;
+      font-feature-settings: "tnum" 1;
+      letter-spacing: 0.01em;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 260ms ease, transform 260ms cubic-bezier(.2,.8,.2,1), filter 260ms ease;
+      transform-origin: center bottom;
+      z-index: 2147483000;
+      user-select: none;
+    }
+    .overlay[data-visible] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translate(-50%, 0) scale(1);
+      filter: blur(0);
+    }
+
+    .btn {
+      appearance: none;
+      -webkit-appearance: none;
+      background: transparent;
+      border: 0;
+      margin: 0;
+      padding: 0;
+      color: inherit;
+      font: inherit;
+      cursor: default;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 28px;
+      min-width: 28px;
+      border-radius: 999px;
+      color: rgba(255,255,255,0.72);
+      transition: background 140ms ease, color 140ms ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+    .btn:active { background: rgba(255,255,255,0.18); }
+    .btn:focus { outline: none; }
+    .btn:focus-visible { outline: none; }
+    .btn::-moz-focus-inner { border: 0; }
+    .btn svg { width: 14px; height: 14px; display: block; }
+    .btn.reset {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      padding: 0 10px 0 12px;
+      gap: 6px;
+      color: rgba(255,255,255,0.72);
+    }
+    .btn.reset .kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 16px;
+      height: 16px;
+      padding: 0 4px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 10px;
+      line-height: 1;
+      color: rgba(255,255,255,0.88);
+      background: rgba(255,255,255,0.12);
+      border-radius: 4px;
+    }
+
+    .count {
+      font-variant-numeric: tabular-nums;
+      color: #fff;
+      font-weight: 500;
+      padding: 0 8px;
+      min-width: 42px;
+      text-align: center;
+      font-size: 12px;
+    }
+    .count .sep { color: rgba(255,255,255,0.45); margin: 0 3px; font-weight: 400; }
+    .count .total { color: rgba(255,255,255,0.55); }
+
+    .divider {
+      width: 1px;
+      height: 14px;
+      background: rgba(255,255,255,0.18);
+      margin: 0 2px;
+    }
+
+    /* ── Print: one page per slide, no chrome ────────────────────────────
+       The screen layout stacks every slide at inset:0 inside a scaled
+       canvas; for print we want them in document flow at the authored
+       design size so the browser paginates one slide per sheet. The
+       @page size is set from the width/height attributes via the inline
+       <style id="deck-stage-print-page"> that connectedCallback injects
+       into <head> (the @page at-rule has no effect inside shadow DOM). */
+    @media print {
+      :host {
+        position: static;
+        inset: auto;
+        background: none;
+        overflow: visible;
+        color: inherit;
+      }
+      .stage { position: static; display: block; }
+      .canvas {
+        transform: none !important;
+        width: auto !important;
+        height: auto !important;
+        background: none;
+        will-change: auto;
+      }
+      ::slotted(*) {
+        position: relative !important;
+        inset: auto !important;
+        width: var(--deck-design-w) !important;
+        height: var(--deck-design-h) !important;
+        box-sizing: border-box !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        pointer-events: auto;
+        break-after: page;
+        page-break-after: always;
+        break-inside: avoid;
+        overflow: hidden;
+      }
+      ::slotted(*:last-child) {
+        break-after: auto;
+        page-break-after: auto;
+      }
+      .overlay, .tapzones { display: none !important; }
+    }
+  `;
+
+  class DeckStage extends HTMLElement {
+    static get observedAttributes() { return ['width', 'height', 'noscale']; }
+
+    constructor() {
+      super();
+      this._root = this.attachShadow({ mode: 'open' });
+      this._index = 0;
+      this._slides = [];
+      this._notes = [];
+      this._hideTimer = null;
+      this._mouseIdleTimer = null;
+      this._storageKey = STORAGE_PREFIX + (location.pathname || '/');
+
+      this._onKey = this._onKey.bind(this);
+      this._onResize = this._onResize.bind(this);
+      this._onSlotChange = this._onSlotChange.bind(this);
+      this._onMouseMove = this._onMouseMove.bind(this);
+      this._onTapBack = this._onTapBack.bind(this);
+      this._onTapForward = this._onTapForward.bind(this);
+    }
+
+    get designWidth() {
+      return parseInt(this.getAttribute('width'), 10) || DESIGN_W_DEFAULT;
+    }
+    get designHeight() {
+      return parseInt(this.getAttribute('height'), 10) || DESIGN_H_DEFAULT;
+    }
+
+    connectedCallback() {
+      this._render();
+      this._loadNotes();
+      this._syncPrintPageRule();
+      window.addEventListener('keydown', this._onKey);
+      window.addEventListener('resize', this._onResize);
+      window.addEventListener('mousemove', this._onMouseMove, { passive: true });
+      // Initial collection + layout happens via slotchange, which fires on mount.
+    }
+
+    disconnectedCallback() {
+      window.removeEventListener('keydown', this._onKey);
+      window.removeEventListener('resize', this._onResize);
+      window.removeEventListener('mousemove', this._onMouseMove);
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      if (this._mouseIdleTimer) clearTimeout(this._mouseIdleTimer);
+    }
+
+    attributeChangedCallback() {
+      if (this._canvas) {
+        this._canvas.style.width = this.designWidth + 'px';
+        this._canvas.style.height = this.designHeight + 'px';
+        this._canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+        this._canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+        this._fit();
+        this._syncPrintPageRule();
+      }
+    }
+
+    _render() {
+      const style = document.createElement('style');
+      style.textContent = stylesheet;
+
+      const stage = document.createElement('div');
+      stage.className = 'stage';
+
+      const canvas = document.createElement('div');
+      canvas.className = 'canvas';
+      canvas.style.width = this.designWidth + 'px';
+      canvas.style.height = this.designHeight + 'px';
+      canvas.style.setProperty('--deck-design-w', this.designWidth + 'px');
+      canvas.style.setProperty('--deck-design-h', this.designHeight + 'px');
+
+      const slot = document.createElement('slot');
+      slot.addEventListener('slotchange', this._onSlotChange);
+      canvas.appendChild(slot);
+      stage.appendChild(canvas);
+
+      // Tap zones (mobile): left third = back, right third = forward.
+      const tapzones = document.createElement('div');
+      tapzones.className = 'tapzones export-hidden';
+      tapzones.setAttribute('aria-hidden', 'true');
+      const tzBack = document.createElement('div');
+      tzBack.className = 'tapzone tapzone--back';
+      const tzMid = document.createElement('div');
+      tzMid.className = 'tapzone tapzone--mid';
+      tzMid.style.pointerEvents = 'none';
+      const tzFwd = document.createElement('div');
+      tzFwd.className = 'tapzone tapzone--fwd';
+      tzBack.addEventListener('click', this._onTapBack);
+      tzFwd.addEventListener('click', this._onTapForward);
+      tapzones.append(tzBack, tzMid, tzFwd);
+
+      // Overlay: compact, solid black, with clickable controls.
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay export-hidden';
+      overlay.setAttribute('role', 'toolbar');
+      overlay.setAttribute('aria-label', 'Deck controls');
+      overlay.innerHTML = `
+        <button class="btn prev" type="button" aria-label="Previous slide" title="Previous (←)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>
+        </button>
+        <span class="count" aria-live="polite"><span class="current">1</span><span class="sep">/</span><span class="total">1</span></span>
+        <button class="btn next" type="button" aria-label="Next slide" title="Next (→)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>
+        </button>
+        <span class="divider"></span>
+        <button class="btn reset" type="button" aria-label="Reset to first slide" title="Reset (R)">Reset<span class="kbd">R</span></button>
+      `;
+
+      overlay.querySelector('.prev').addEventListener('click', () => this._go(this._index - 1, 'click'));
+      overlay.querySelector('.next').addEventListener('click', () => this._go(this._index + 1, 'click'));
+      overlay.querySelector('.reset').addEventListener('click', () => this._go(0, 'click'));
+
+      this._root.append(style, stage, tapzones, overlay);
+      this._canvas = canvas;
+      this._slot = slot;
+      this._overlay = overlay;
+      this._countEl = overlay.querySelector('.current');
+      this._totalEl = overlay.querySelector('.total');
+    }
+
+    /** @page must live in the document stylesheet — it's a no-op inside
+     *  shadow DOM. Inject/update a single <head> style tag so the print
+     *  sheet matches the design size and Save-as-PDF yields one slide per
+     *  page with no margins. */
+    _syncPrintPageRule() {
+      const id = 'deck-stage-print-page';
+      let tag = document.getElementById(id);
+      if (!tag) {
+        tag = document.createElement('style');
+        tag.id = id;
+        document.head.appendChild(tag);
+      }
+      tag.textContent =
+        '@page { size: ' + this.designWidth + 'px ' + this.designHeight + 'px; margin: 0; } ' +
+        '@media print { html, body { margin: 0 !important; padding: 0 !important; background: none !important; overflow: visible !important; height: auto !important; } ' +
+        '* { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }';
+    }
+
+    _onSlotChange() {
+      this._collectSlides();
+      this._restoreIndex();
+      this._applyIndex({ showOverlay: false, broadcast: true, reason: 'init' });
+      this._fit();
+    }
+
+    _collectSlides() {
+      const assigned = this._slot.assignedElements({ flatten: true });
+      this._slides = assigned.filter((el) => {
+        // Skip template/style/script nodes even if someone slots them.
+        const tag = el.tagName;
+        return tag !== 'TEMPLATE' && tag !== 'SCRIPT' && tag !== 'STYLE';
+      });
+
+      this._slides.forEach((slide, i) => {
+        const n = i + 1;
+        // Determine a label for comment flow: prefer explicit data-label,
+        // then an existing data-screen-label, then first heading, else "Slide".
+        let label = slide.getAttribute('data-label');
+        if (!label) {
+          const existing = slide.getAttribute('data-screen-label');
+          if (existing) {
+            // Strip any leading number the author may have included.
+            label = existing.replace(/^\s*\d+\s*/, '').trim() || existing;
+          }
+        }
+        if (!label) {
+          const h = slide.querySelector('h1, h2, h3, [data-title]');
+          if (h) label = (h.textContent || '').trim().slice(0, 40);
+        }
+        if (!label) label = 'Slide';
+        slide.setAttribute('data-screen-label', `${pad2(n)} ${label}`);
+
+        // Validation attribute for comment flow / auto-checks.
+        if (!slide.hasAttribute('data-om-validate')) {
+          slide.setAttribute('data-om-validate', VALIDATE_ATTR);
+        }
+
+        slide.setAttribute('data-deck-slide', String(i));
+      });
+
+      if (this._totalEl) this._totalEl.textContent = String(this._slides.length || 1);
+      if (this._index >= this._slides.length) this._index = Math.max(0, this._slides.length - 1);
+    }
+
+    _loadNotes() {
+      const tag = document.getElementById('speaker-notes');
+      if (!tag) { this._notes = []; return; }
+      try {
+        const parsed = JSON.parse(tag.textContent || '[]');
+        if (Array.isArray(parsed)) this._notes = parsed;
+      } catch (e) {
+        console.warn('[deck-stage] Failed to parse #speaker-notes JSON:', e);
+        this._notes = [];
+      }
+    }
+
+    _restoreIndex() {
+      try {
+        const raw = localStorage.getItem(this._storageKey);
+        if (raw != null) {
+          const n = parseInt(raw, 10);
+          if (Number.isFinite(n) && n >= 0 && n < this._slides.length) {
+            this._index = n;
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    _persistIndex() {
+      try { localStorage.setItem(this._storageKey, String(this._index)); }
+      catch (e) { /* ignore */ }
+    }
+
+    _applyIndex({ showOverlay = true, broadcast = true, reason = 'init' } = {}) {
+      if (!this._slides.length) return;
+      const prev = this._prevIndex == null ? -1 : this._prevIndex;
+      const curr = this._index;
+      this._slides.forEach((s, i) => {
+        if (i === curr) s.setAttribute('data-deck-active', '');
+        else s.removeAttribute('data-deck-active');
+      });
+      if (this._countEl) this._countEl.textContent = String(curr + 1);
+      this._persistIndex();
+
+      if (broadcast) {
+        // (1) Legacy: host-window postMessage for speaker-notes renderers.
+        try { window.postMessage({ slideIndexChanged: curr }, '*'); } catch (e) {}
+
+        // (2) In-page CustomEvent on the <deck-stage> element itself.
+        //     Bubbles and composes out of shadow DOM so slide code can listen:
+        //       document.querySelector('deck-stage').addEventListener('slidechange', e => {
+        //         e.detail.index, e.detail.previousIndex, e.detail.total, e.detail.slide, e.detail.reason
+        //       });
+        const detail = {
+          index: curr,
+          previousIndex: prev,
+          total: this._slides.length,
+          slide: this._slides[curr] || null,
+          previousSlide: prev >= 0 ? (this._slides[prev] || null) : null,
+          reason: reason, // 'init' | 'keyboard' | 'click' | 'tap' | 'api'
+        };
+        this.dispatchEvent(new CustomEvent('slidechange', {
+          detail,
+          bubbles: true,
+          composed: true,
+        }));
+      }
+
+      this._prevIndex = curr;
+      if (showOverlay) this._flashOverlay();
+    }
+
+    _flashOverlay() {
+      if (!this._overlay) return;
+      this._overlay.setAttribute('data-visible', '');
+      if (this._hideTimer) clearTimeout(this._hideTimer);
+      this._hideTimer = setTimeout(() => {
+        this._overlay.removeAttribute('data-visible');
+      }, OVERLAY_HIDE_MS);
+    }
+
+    _fit() {
+      if (!this._canvas) return;
+      // PPTX export sets noscale so the DOM capture sees authored-size
+      // geometry — the scaled canvas is in shadow DOM, so the exporter's
+      // resetTransformSelector can't reach .canvas.style.transform directly.
+      if (this.hasAttribute('noscale')) {
+        this._canvas.style.transform = 'none';
+        return;
+      }
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const s = Math.min(vw / this.designWidth, vh / this.designHeight);
+      this._canvas.style.transform = `scale(${s})`;
+    }
+
+    _onResize() { this._fit(); }
+
+    _onMouseMove() {
+      // Keep overlay visible while mouse moves; hide after idle.
+      this._flashOverlay();
+    }
+
+    _onTapBack(e) {
+      e.preventDefault();
+      this._go(this._index - 1, 'tap');
+    }
+
+    _onTapForward(e) {
+      e.preventDefault();
+      this._go(this._index + 1, 'tap');
+    }
+
+    _onKey(e) {
+      // Ignore when the user is typing.
+      const t = e.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const key = e.key;
+      let handled = true;
+
+      if (key === 'ArrowRight' || key === 'PageDown' || key === ' ' || key === 'Spacebar') {
+        this._go(this._index + 1, 'keyboard');
+      } else if (key === 'ArrowLeft' || key === 'PageUp') {
+        this._go(this._index - 1, 'keyboard');
+      } else if (key === 'Home') {
+        this._go(0, 'keyboard');
+      } else if (key === 'End') {
+        this._go(this._slides.length - 1, 'keyboard');
+      } else if (key === 'r' || key === 'R') {
+        this._go(0, 'keyboard');
+      } else if (/^[0-9]$/.test(key)) {
+        // 1..9 jump to that slide; 0 jumps to 10.
+        const n = key === '0' ? 9 : parseInt(key, 10) - 1;
+        if (n < this._slides.length) this._go(n, 'keyboard');
+      } else {
+        handled = false;
+      }
+
+      if (handled) {
+        e.preventDefault();
+        this._flashOverlay();
+      }
+    }
+
+    _go(i, reason = 'api') {
+      if (!this._slides.length) return;
+      const clamped = Math.max(0, Math.min(this._slides.length - 1, i));
+      if (clamped === this._index) {
+        this._flashOverlay();
+        return;
+      }
+      this._index = clamped;
+      this._applyIndex({ showOverlay: true, broadcast: true, reason });
+    }
+
+    // Public API ------------------------------------------------------------
+
+    /** Current slide index (0-based). */
+    get index() { return this._index; }
+    /** Total slide count. */
+    get length() { return this._slides.length; }
+    /** Programmatically navigate. */
+    goTo(i) { this._go(i, 'api'); }
+    next() { this._go(this._index + 1, 'api'); }
+    prev() { this._go(this._index - 1, 'api'); }
+    reset() { this._go(0, 'api'); }
+  }
+
+  if (!customElements.get('deck-stage')) {
+    customElements.define('deck-stage', DeckStage);
+  }
+})();
+
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;500;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<script>
+/* Tweak defaults — persist via host protocol */
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "intensity": 5,
+  "shake": true,
+  "caps": false,
+  "accent": "#ff2e17",
+  "paper": "#0a0a0a"
+}/*EDITMODE-END*/;
+</script>
+
+<style>
+  :root {
+    --paper: #0A0A0A;
+    --ink: #F5F5F2;
+    --ink-dim: rgba(245,245,242,0.6);
+    --ink-mute: rgba(245,245,242,0.35);
+    --rule: rgba(245,245,242,0.12);
+
+    /* Neon rotation */
+    --cyan:    #00F5D4;
+    --magenta: #FF2E93;
+    --lime:    #D4FF00;
+    --orange:  #FF6B1A;
+    --red:     #FF2E17;
+
+    --grain-opacity: 0.06;
+  }
+
+  html, body { margin: 0; padding: 0; background: #000; color: var(--ink); }
+  body { font-family: "Inter", -apple-system, sans-serif; }
+
+  /* ─────────────── Typography ─────────────── */
+  .f-display { font-family: "Unbounded", "Space Grotesk", sans-serif; font-weight: 900; letter-spacing: -0.04em; line-height: 0.86; }
+  .f-display-lt { font-family: "Unbounded", sans-serif; font-weight: 700; letter-spacing: -0.03em; }
+  .f-grotesk { font-family: "Space Grotesk", sans-serif; font-weight: 500; letter-spacing: -0.01em; }
+  .f-mono { font-family: "Space Mono", ui-monospace, monospace; font-weight: 400; letter-spacing: 0; }
+  .f-body { font-family: "Inter", sans-serif; font-weight: 400; letter-spacing: -0.005em; }
+
+  /* ─────────────── Slide base ─────────────── */
+  .slide {
+    background: var(--paper);
+    color: var(--ink);
+    position: relative;
+    overflow: hidden;
+    padding: 96px 120px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Film grain — subtle, structural */
+  .slide::before {
+    content: "";
+    position: absolute;
+    inset: -10%;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.95' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.6 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='1'/></svg>");
+    opacity: var(--grain-opacity);
+    pointer-events: none;
+    mix-blend-mode: screen;
+    z-index: 4;
+  }
+
+  /* Horizontal scanline overlay — super light */
+  .slide::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      rgba(255,255,255,0.012) 0px,
+      rgba(255,255,255,0.012) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+    pointer-events: none;
+    z-index: 3;
+  }
+
+  /* ─────────────── Slide chrome ─────────────── */
+  .chrome {
+    position: absolute;
+    top: 40px; left: 120px; right: 120px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: "Space Mono", monospace;
+    font-size: 14px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    z-index: 5;
+  }
+  .chrome .accent-dot {
+    display: inline-block;
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--accent, var(--magenta));
+    box-shadow: 0 0 14px currentColor;
+    color: var(--accent, var(--magenta));
+    margin-right: 10px;
+    vertical-align: middle;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  .chrome .section-label { color: var(--ink-dim); }
+  .chrome .page-num { font-variant-numeric: tabular-nums; }
+
+  .footer-line {
+    position: absolute;
+    left: 120px; right: 120px; bottom: 40px;
+    display: flex; justify-content: space-between; align-items: center;
+    font-family: "Space Mono", monospace;
+    font-size: 13px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    z-index: 5;
+  }
+  .footer-line .bar {
+    height: 1px; flex: 1; margin: 0 24px;
+    background: linear-gradient(90deg, transparent, var(--rule), transparent);
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.55; transform: scale(0.85); }
+  }
+
+  /* ─────────────── Entry animation ─────────────── */
+  .slide[data-deck-active] .stagger > * {
+    animation: fadeUp 620ms cubic-bezier(.2,.8,.2,1) both;
+  }
+  .slide[data-deck-active] .stagger > *:nth-child(1) { animation-delay: 40ms; }
+  .slide[data-deck-active] .stagger > *:nth-child(2) { animation-delay: 180ms; }
+  .slide[data-deck-active] .stagger > *:nth-child(3) { animation-delay: 300ms; }
+  .slide[data-deck-active] .stagger > *:nth-child(4) { animation-delay: 420ms; }
+  .slide[data-deck-active] .stagger > *:nth-child(5) { animation-delay: 540ms; }
+  .slide[data-deck-active] .stagger > *:nth-child(6) { animation-delay: 660ms; }
+  .slide[data-deck-active] .stagger > *:nth-child(7) { animation-delay: 780ms; }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(18px); filter: blur(10px); }
+    to   { opacity: 1; transform: translateY(0);    filter: blur(0); }
+  }
+
+  /* Letter stagger for cover title */
+  .letter-stagger span {
+    display: inline-block;
+    opacity: 0;
+    transform: translateY(40px) scale(1.02);
+    filter: blur(20px);
+  }
+  .slide[data-deck-active] .letter-stagger span {
+    animation: letterIn 900ms cubic-bezier(.22,.8,.2,1) both;
+  }
+  @keyframes letterIn {
+    to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+  }
+
+  /* Shake micro-animation for magenta cover particle field */
+  @keyframes drift {
+    0%, 100% { transform: translate(0,0); }
+    33% { transform: translate(6px, -4px); }
+    66% { transform: translate(-4px, 5px); }
+  }
+
+  /* ─────────────── Utilities ─────────────── */
+  .glow-cyan    { color: var(--cyan);    text-shadow: 0 0 40px rgba(0,245,212,0.45), 0 0 100px rgba(0,245,212,0.25); }
+  .glow-magenta { color: var(--magenta); text-shadow: 0 0 40px rgba(255,46,147,0.55), 0 0 120px rgba(255,46,147,0.35); }
+  .glow-lime    { color: var(--lime);    text-shadow: 0 0 40px rgba(212,255,0,0.45), 0 0 100px rgba(212,255,0,0.22); }
+  .glow-orange  { color: var(--orange);  text-shadow: 0 0 40px rgba(255,107,26,0.55), 0 0 120px rgba(255,107,26,0.28); }
+  .glow-red     { color: var(--red);     text-shadow: 0 0 40px rgba(255,46,23,0.55), 0 0 120px rgba(255,46,23,0.3); }
+
+  .strike-red {
+    position: relative;
+    display: inline-block;
+  }
+  .strike-red::after {
+    content: "";
+    position: absolute;
+    left: -4%; right: -4%;
+    top: 52%;
+    height: 6px;
+    background: var(--magenta);
+    box-shadow: 0 0 16px var(--magenta);
+    transform: scaleX(0);
+    transform-origin: left center;
+    animation: strike 700ms cubic-bezier(.7,.1,.3,1) both;
+    animation-delay: 900ms;
+  }
+  .slide[data-deck-active] .strike-red::after { animation-play-state: running; }
+  @keyframes strike {
+    from { transform: scaleX(0); }
+    to   { transform: scaleX(1); }
+  }
+
+  /* checkmark glyph */
+  .check {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 64px; height: 64px;
+    border: 3px solid var(--cyan);
+    color: var(--cyan);
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700;
+    font-size: 42px;
+    line-height: 1;
+    flex-shrink: 0;
+    box-shadow: 0 0 24px rgba(0,245,212,0.25);
+  }
+  .cross {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 64px; height: 64px;
+    border: 3px solid var(--magenta);
+    color: var(--magenta);
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700;
+    font-size: 38px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  /* ─────────────── Per-slide layouts ─────────────── */
+
+  /* Slide 1 — COVER */
+  .cover { padding: 0; }
+  .cover .cover-inner {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding: 120px;
+    z-index: 2;
+  }
+  .cover h1 {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 900;
+    font-size: 240px;
+    line-height: 0.82;
+    letter-spacing: -0.055em;
+    margin: 0;
+    white-space: nowrap;
+    color: var(--magenta);
+    text-shadow:
+      0 0 60px rgba(255,46,147,0.45),
+      0 0 180px rgba(255,46,147,0.35),
+      0 0 280px rgba(255,46,23,0.22);
+  }
+  .cover .subtitle {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 500;
+    font-size: 44px;
+    color: var(--ink);
+    margin: 48px 0 0;
+    max-width: 1400px;
+    letter-spacing: -0.015em;
+  }
+  .cover .bottom-line {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 700;
+    font-size: 56px;
+    color: var(--ink);
+    margin: 40px 0 0;
+    letter-spacing: -0.035em;
+  }
+  .cover .bottom-line em {
+    color: var(--magenta);
+    font-style: normal;
+  }
+
+  .cover-glow {
+    position: absolute;
+    left: -10%; right: -10%;
+    bottom: -30%;
+    height: 70%;
+    background: radial-gradient(ellipse at center bottom,
+      rgba(255,46,23,0.55) 0%,
+      rgba(255,46,147,0.35) 25%,
+      rgba(255,46,23,0.15) 45%,
+      transparent 70%);
+    filter: blur(20px);
+    z-index: 1;
+    pointer-events: none;
+  }
+
+  .corner-badge {
+    position: absolute;
+    top: 48px; right: 48px;
+    display: flex; align-items: center; gap: 12px;
+    font-family: "Space Mono", monospace;
+    font-size: 14px;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    color: var(--ink);
+    border: 1px solid rgba(255,46,147,0.55);
+    padding: 14px 22px;
+    background: rgba(10,10,10,0.5);
+    z-index: 6;
+    backdrop-filter: blur(6px);
+  }
+  .corner-badge .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--magenta);
+    box-shadow: 0 0 12px var(--magenta);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+
+  .cover-meta-left {
+    position: absolute;
+    top: 48px; left: 48px;
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.22em;
+    color: var(--ink-mute);
+    text-transform: uppercase;
+    z-index: 6;
+    line-height: 1.8;
+  }
+
+  .cover-meta-bottom {
+    position: absolute;
+    bottom: 40px; right: 48px;
+    font-family: "Space Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.2em;
+    color: var(--ink-mute);
+    text-transform: uppercase;
+    z-index: 6;
+    text-align: right;
+    line-height: 1.8;
+  }
+
+  /* Particle field SVG layer */
+  .particle-field {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    opacity: 0.8;
+  }
+
+  /* Slide 2 — BEFORE */
+  .before-after .section-tag {
+    font-family: "Space Mono", monospace;
+    font-size: 16px; letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    margin-bottom: 24px;
+  }
+  .before-after h2 {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 900;
+    font-size: 160px;
+    line-height: 0.85;
+    margin: 0 0 80px;
+    letter-spacing: -0.045em;
+  }
+  .before-after .rows {
+    display: flex; flex-direction: column; gap: 44px;
+    max-width: 1500px;
+  }
+  .before-after .row {
+    display: flex; align-items: center; gap: 32px;
+  }
+  .before-after .row-text {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 500;
+    font-size: 40px;
+    line-height: 1.15;
+    color: var(--ink);
+    letter-spacing: -0.018em;
+  }
+  .before-after .kicker {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 900;
+    font-size: 64px;
+    line-height: 1;
+    margin-top: 72px;
+    letter-spacing: -0.035em;
+    color: var(--magenta);
+    text-shadow: 0 0 30px rgba(255,46,147,0.35);
+  }
+  .before-after .kicker.cyan { color: var(--cyan); text-shadow: 0 0 30px rgba(0,245,212,0.4); }
+
+  /* Slide 4-11 — SUPERPOWER */
+  .super .super-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(520px, 1fr);
+    gap: 80px;
+    flex: 1;
+    align-items: center;
+    margin-top: 60px;
+  }
+  .super .super-grid > * { min-width: 0; }
+  .super .super-num {
+    font-family: "Space Mono", monospace;
+    font-size: 16px;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    margin-bottom: 20px;
+  }
+  .super .super-num b {
+    color: var(--accent, var(--magenta));
+    font-weight: 700;
+  }
+  .super h2 {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 900;
+    font-size: 150px;
+    line-height: 0.84;
+    letter-spacing: -0.05em;
+    margin: 0 0 0;
+    color: var(--ink);
+  }
+  .super h2 .accent-slash {
+    color: var(--accent, var(--magenta));
+  }
+  .super .body {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 400;
+    font-size: 34px;
+    line-height: 1.25;
+    color: var(--ink);
+    letter-spacing: -0.01em;
+    margin-top: 56px;
+    max-width: 1050px;
+  }
+  .super .subline {
+    font-family: "Space Mono", monospace;
+    font-size: 20px;
+    letter-spacing: 0.04em;
+    line-height: 1.55;
+    color: var(--ink-dim);
+    margin-top: 44px;
+    padding-top: 28px;
+    border-top: 1px solid var(--rule);
+    max-width: 900px;
+  }
+
+  /* Visual column */
+  .super .visual {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1 / 1.1;
+    max-width: 640px;
+    margin-left: auto;
+  }
+
+  /* Slide 12 — FINAL */
+  .final {
+    padding: 0;
+    justify-content: center;
+    align-items: flex-start;
+  }
+  .final-inner {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 120px 160px;
+    gap: 0;
+  }
+  .final .l1 {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 800;
+    font-size: 120px;
+    line-height: 0.9;
+    letter-spacing: -0.04em;
+    color: var(--ink-dim);
+  }
+  .final .l2 {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 800;
+    font-size: 170px;
+    line-height: 0.88;
+    letter-spacing: -0.048em;
+    color: var(--ink);
+    margin-top: 12px;
+  }
+  .final .l3 {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 900;
+    font-size: 240px;
+    line-height: 0.85;
+    letter-spacing: -0.055em;
+    color: var(--ink);
+    margin-top: 16px;
+    display: flex; align-items: center; gap: 44px;
+  }
+  .final .l3 .live-dot {
+    display: inline-block;
+    width: 48px; height: 48px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow:
+      0 0 40px var(--cyan),
+      0 0 120px rgba(0,245,212,0.6);
+    animation: pulse 1.2s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+  .final .tiny {
+    position: absolute;
+    left: 160px; bottom: 60px;
+    font-family: "Space Mono", monospace;
+    font-size: 16px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+  }
+  .final .agent-mark {
+    position: absolute;
+    top: 60px; right: 160px;
+    font-family: "Space Mono", monospace;
+    font-size: 16px;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: var(--ink-mute);
+    text-align: right;
+    line-height: 1.8;
+  }
+  .final .agent-mark b {
+    color: var(--cyan);
+    font-weight: 400;
+  }
+
+  /* SVG placeholders and abstractions */
+  .blueprint {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  /* Arsenal grid (slide 10) */
+  .arsenal {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 14px;
+    width: 100%;
+    height: 100%;
+  }
+  .arsenal .tile {
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.015);
+    position: relative;
+    aspect-ratio: 1;
+    display: flex; flex-direction: column; justify-content: space-between;
+    padding: 14px;
+    box-sizing: border-box;
+  }
+  .arsenal .tile .tl {
+    font-family: "Space Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    color: var(--ink-mute);
+    text-transform: uppercase;
+  }
+  .arsenal .tile .ttl {
+    font-family: "Unbounded", sans-serif;
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: -0.01em;
+    line-height: 1;
+    color: var(--ink);
+  }
+
+  /* Hide overlay/tap zones in print */
+  @media print {
+    .slide::before { opacity: 0.04; }
+  }
+</style>
+</head>
+<body>
+
+<script type="application/json" id="speaker-notes">
+[]
+</script>
+
+<deck-stage width="1920" height="1080">
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 1 — COVER
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide cover" data-label="Cover">
+    <div class="cover-glow"></div>
+
+    <!-- particle field -->
+    <svg class="particle-field" viewBox="0 0 1920 1080" preserveAspectRatio="none">
+      <defs>
+        <radialGradient id="pgrad" cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stop-color="#FF2E93" stop-opacity="0.9"/>
+          <stop offset="100%" stop-color="#FF2E93" stop-opacity="0"/>
+        </radialGradient>
+      </defs>
+      <g style="animation: drift 8s ease-in-out infinite;">
+        <!-- scattered magenta particles forming a light dust -->
+        <circle cx="120" cy="200" r="1.5" fill="#FF2E93" opacity="0.6"/>
+        <circle cx="240" cy="140" r="2" fill="#FF2E93" opacity="0.5"/>
+        <circle cx="380" cy="260" r="1" fill="#FF2E93" opacity="0.7"/>
+        <circle cx="520" cy="180" r="1.8" fill="#FF2E93" opacity="0.4"/>
+        <circle cx="680" cy="340" r="1.2" fill="#FF2E93" opacity="0.55"/>
+        <circle cx="840" cy="220" r="2" fill="#FF2E93" opacity="0.5"/>
+        <circle cx="1000" cy="150" r="1" fill="#FF2E93" opacity="0.7"/>
+        <circle cx="1160" cy="280" r="1.6" fill="#FF2E93" opacity="0.45"/>
+        <circle cx="1340" cy="200" r="2.2" fill="#FF2E93" opacity="0.6"/>
+        <circle cx="1500" cy="340" r="1.4" fill="#FF2E93" opacity="0.5"/>
+        <circle cx="1680" cy="180" r="1" fill="#FF2E93" opacity="0.7"/>
+        <circle cx="1800" cy="280" r="1.8" fill="#FF2E93" opacity="0.4"/>
+        <circle cx="80" cy="500" r="1.2" fill="#FF2E93" opacity="0.5"/>
+        <circle cx="300" cy="640" r="1" fill="#FF2E93" opacity="0.6"/>
+        <circle cx="1600" cy="720" r="1.5" fill="#FF2E93" opacity="0.4"/>
+        <circle cx="1780" cy="580" r="1" fill="#FF2E93" opacity="0.6"/>
+        <circle cx="460" cy="880" r="2" fill="#FF2E17" opacity="0.5"/>
+        <circle cx="720" cy="920" r="1.4" fill="#FF2E17" opacity="0.45"/>
+        <circle cx="1120" cy="880" r="1" fill="#FF2E17" opacity="0.6"/>
+        <circle cx="1380" cy="940" r="1.8" fill="#FF2E17" opacity="0.5"/>
+      </g>
+    </svg>
+
+    <div class="cover-meta-left">
+      RU/LAT · ДИЗАЙН-АГЕНТ<br/>
+      ДОСЬЕ · 2026
+    </div>
+
+    <div class="corner-badge">
+      <span class="dot"></span>
+      <span>AGENT v1.0 · LIVE</span>
+    </div>
+
+    <div class="cover-inner">
+      <h1 class="letter-stagger">
+        <span>Д</span><span>И</span><span>З</span><span>А</span><span>Й</span><span>Н</span><span>Е</span><span>Р</span>
+      </h1>
+      <div class="stagger">
+        <p class="subtitle">Супергерой визуала в&nbsp;твоём&nbsp;AI‑офисе.</p>
+        <p class="bottom-line">Одна команда — <em>и&nbsp;он в&nbsp;команде.</em></p>
+      </div>
+    </div>
+
+    <div class="cover-meta-bottom">
+      ISSUE 01 / 12<br/>
+      A SUPERHERO INTRO
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 2 — РАНЬШЕ
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide before-after" data-label="Раньше" style="--accent: var(--magenta);">
+    <div class="chrome">
+      <div><span class="accent-dot"></span><span class="section-label">ИСХОДНОЕ СОСТОЯНИЕ</span></div>
+      <div class="page-num">02 / 12</div>
+    </div>
+
+    <div class="stagger" style="margin-top: 40px;">
+      <div class="section-tag">Досье · Глава I</div>
+      <h2>Раньше было<br/><span style="color: var(--magenta); text-shadow: 0 0 40px rgba(255,46,147,0.35);">так.</span></h2>
+
+      <div class="rows">
+        <div class="row">
+          <div class="cross">✕</div>
+          <div class="row-text"><span class="strike-red">Фрилансер. Три дня. Двадцать тысяч. Один вариант.</span></div>
+        </div>
+        <div class="row">
+          <div class="cross">✕</div>
+          <div class="row-text"><span class="strike-red">ChatGPT. Синий градиент. Улыбающиеся люди из фотобанка.</span></div>
+        </div>
+        <div class="row">
+          <div class="cross">✕</div>
+          <div class="row-text"><span class="strike-red">Ты сам. Час в Figma. Всё равно не&nbsp;то.</span></div>
+        </div>
+      </div>
+
+      <p class="kicker">Каждый дизайн — новый зоопарк.</p>
+    </div>
+
+    <div class="footer-line">
+      <span>CH.01 · PAIN</span>
+      <span class="bar"></span>
+      <span>BEFORE</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 3 — ТЕПЕРЬ
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide before-after" data-label="Теперь" style="--accent: var(--cyan);">
+    <div class="chrome">
+      <div><span class="accent-dot" style="background: var(--cyan); color: var(--cyan);"></span><span class="section-label">ПОСЛЕ АКТИВАЦИИ</span></div>
+      <div class="page-num">03 / 12</div>
+    </div>
+
+    <div class="stagger" style="margin-top: 40px;">
+      <div class="section-tag">Досье · Глава II</div>
+      <h2>Теперь<span style="color: var(--cyan); text-shadow: 0 0 40px rgba(0,245,212,0.5);">.</span></h2>
+
+      <div class="rows">
+        <div class="row">
+          <div class="check">✓</div>
+          <div class="row-text">Десять минут. Твой визуальный стиль. <b style="color: var(--cyan); font-weight: 600;">Навсегда.</b></div>
+        </div>
+        <div class="row">
+          <div class="check">✓</div>
+          <div class="row-text">Тридцать секунд. Готовый результат. <b style="color: var(--cyan); font-weight: 600;">Без переделок.</b></div>
+        </div>
+        <div class="row">
+          <div class="check">✓</div>
+          <div class="row-text">Твоя память. Твой бренд. <b style="color: var(--cyan); font-weight: 600;">Твоя система.</b></div>
+        </div>
+      </div>
+
+      <p class="kicker cyan">Один стиль. Все дизайны. Бесконечная система.</p>
+    </div>
+
+    <div class="footer-line">
+      <span>CH.02 · GAIN</span>
+      <span class="bar"></span>
+      <span>AFTER</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 4 — SUPERPOWER 1 · ПАМЯТЬ БРЕНДА
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide super" data-label="Память бренда" style="--accent: var(--magenta);">
+    <div class="chrome">
+      <div><span class="accent-dot"></span><span class="section-label">СУПЕРСИЛА №1 · BRAND OS</span></div>
+      <div class="page-num">04 / 12</div>
+    </div>
+
+    <div class="super-grid stagger">
+      <div>
+        <div class="super-num">Суперсила <b>№01</b> · <b>S1</b></div>
+        <h2>ПАМЯТЬ<br/>БРЕН<span class="accent-slash">Д</span>А</h2>
+        <p class="body">
+          Собирает твой <b style="color: var(--magenta);">Brand Book</b> за десять минут разговора.
+          Палитра в конкретных цветах. Шрифты из Google&nbsp;Fonts.
+          Настроение в трёх прилагательных. Запреты — чёрным по&nbsp;красному.
+        </p>
+        <p class="subline">
+          → Каждый следующий дизайн — в&nbsp;этой системе. Автоматически.
+        </p>
+      </div>
+
+      <div class="visual">
+        <!-- Shield / badge with palette -->
+        <svg viewBox="0 0 600 660" class="blueprint" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <linearGradient id="shieldG" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#FF2E93" stop-opacity="0.35"/>
+              <stop offset="100%" stop-color="#FF2E93" stop-opacity="0.05"/>
+            </linearGradient>
+            <filter id="blur1"><feGaussianBlur stdDeviation="3"/></filter>
+          </defs>
+
+          <!-- Crosshair ticks -->
+          <g stroke="rgba(255,255,255,0.18)" stroke-width="1">
+            <line x1="300" y1="0" x2="300" y2="40"/>
+            <line x1="300" y1="620" x2="300" y2="660"/>
+            <line x1="0" y1="330" x2="40" y2="330"/>
+            <line x1="560" y1="330" x2="600" y2="330"/>
+          </g>
+
+          <!-- Shield path -->
+          <path d="M 300 60 L 520 140 L 520 380 Q 520 500 300 600 Q 80 500 80 380 L 80 140 Z"
+                fill="url(#shieldG)" stroke="#FF2E93" stroke-width="2.5"/>
+
+          <!-- Inner shield outline -->
+          <path d="M 300 110 L 478 174 L 478 372 Q 478 470 300 550 Q 122 470 122 372 L 122 174 Z"
+                fill="none" stroke="rgba(255,46,147,0.35)" stroke-width="1" stroke-dasharray="4 6"/>
+
+          <!-- Palette circle — 5 swatches arranged in a curve -->
+          <g transform="translate(300, 250)">
+            <circle cx="0" cy="0" r="120" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="1" stroke-dasharray="2 4"/>
+            <circle cx="-96" cy="-44" r="24" fill="#FF2E93" stroke="#0A0A0A" stroke-width="3"/>
+            <circle cx="-40" cy="-104" r="24" fill="#0A0A0A" stroke="#F5F5F2" stroke-width="2"/>
+            <circle cx="40" cy="-108" r="24" fill="#F5F5F2"/>
+            <circle cx="96" cy="-44" r="24" fill="#FF6B1A"/>
+            <circle cx="0" cy="40" r="24" fill="#D4FF00"/>
+          </g>
+
+          <!-- Font spec marks -->
+          <g font-family="Unbounded, sans-serif" fill="#FF2E93">
+            <text x="300" y="430" text-anchor="middle" font-size="52" font-weight="900" letter-spacing="-2">Aa</text>
+          </g>
+          <g font-family="Space Mono, monospace" font-size="11" fill="rgba(245,245,242,0.55)" letter-spacing="2">
+            <text x="300" y="462" text-anchor="middle">UNBOUNDED · 900</text>
+            <text x="300" y="482" text-anchor="middle">INTER · 400 / 600</text>
+          </g>
+
+          <!-- Corner labels -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.4)" letter-spacing="2">
+            <text x="14" y="16">BRAND.OS</text>
+            <text x="586" y="16" text-anchor="end">v01</text>
+            <text x="14" y="656">PALETTE · TYPE · MOOD · RULES</text>
+            <text x="586" y="656" text-anchor="end">S1/08</text>
+          </g>
+
+          <!-- Banner -->
+          <g transform="translate(300, 560)">
+            <rect x="-140" y="-22" width="280" height="44" fill="#FF2E93"/>
+            <text x="0" y="8" text-anchor="middle" font-family="Unbounded, sans-serif" font-weight="900" font-size="18" fill="#0A0A0A" letter-spacing="4">BRAND BOOK</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+
+    <div class="footer-line">
+      <span>S1 · BRAND MEMORY</span>
+      <span class="bar"></span>
+      <span>10 MIN → FOREVER</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 5 — SUPERPOWER 2 · ДЕЛАЕТ ВСЁ САМ
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide super" data-label="Делает всё сам" style="--accent: var(--lime);">
+    <div class="chrome">
+      <div><span class="accent-dot" style="background: var(--lime); color: var(--lime);"></span><span class="section-label">СУПЕРСИЛА №2 · AUTONOMY</span></div>
+      <div class="page-num">05 / 12</div>
+    </div>
+
+    <div class="super-grid stagger">
+      <div>
+        <div class="super-num">Суперсила <b style="color: var(--lime);">№02</b> · <b style="color: var(--lime);">S2</b></div>
+        <h2>ДЕЛАЕТ<br/>ВСЁ <span style="color: var(--lime); text-shadow: 0 0 40px rgba(212,255,0,0.45);">САМ.</span></h2>
+        <p class="body">
+          Ты говоришь: «хочу лендинг для курса». Он собирает стиль.
+          Строит структуру. Пишет текст. Верстает интерактив.
+          Выкладывает готовое. Не&nbsp;нравится&nbsp;— <b style="color: var(--lime);">сам переделывает.</b>
+        </p>
+        <p class="subline">
+          → Никакой Figma. Никаких фрилансеров. Никаких трёх дней ожидания.<br/>
+          &nbsp;&nbsp;&nbsp;От мысли до результата — одна фраза.
+        </p>
+      </div>
+
+      <div class="visual" style="aspect-ratio: 1 / 1.1;">
+        <svg viewBox="0 0 600 660" class="blueprint" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <marker id="arrowhead-lime" markerWidth="14" markerHeight="14" refX="7" refY="7" orient="auto">
+              <polygon points="0 0, 14 7, 0 14" fill="#D4FF00"/>
+            </marker>
+          </defs>
+
+          <!-- Left: МЫСЛЬ -->
+          <g>
+            <circle cx="100" cy="330" r="72" fill="none" stroke="rgba(245,245,242,0.2)" stroke-width="1"/>
+            <circle cx="100" cy="330" r="8" fill="#F5F5F2"/>
+            <text x="100" y="240" text-anchor="middle" font-family="Space Mono, monospace" font-size="13" fill="rgba(245,245,242,0.55)" letter-spacing="4">INPUT · 01</text>
+            <text x="100" y="440" text-anchor="middle" font-family="Unbounded, sans-serif" font-weight="900" font-size="26" fill="#F5F5F2" letter-spacing="-1">МЫСЛЬ</text>
+          </g>
+
+          <!-- Motion line/arrow -->
+          <g>
+            <line x1="180" y1="330" x2="500" y2="330" stroke="#D4FF00" stroke-width="4" marker-end="url(#arrowhead-lime)"/>
+            <!-- micro ticks along the arrow -->
+            <g stroke="#D4FF00" stroke-width="1.5" opacity="0.6">
+              <line x1="230" y1="320" x2="230" y2="340"/>
+              <line x1="280" y1="320" x2="280" y2="340"/>
+              <line x1="330" y1="320" x2="330" y2="340"/>
+              <line x1="380" y1="320" x2="380" y2="340"/>
+              <line x1="430" y1="320" x2="430" y2="340"/>
+            </g>
+            <!-- middle annotation -->
+            <g font-family="Space Mono, monospace" font-size="12" fill="rgba(245,245,242,0.55)" letter-spacing="2">
+              <text x="330" y="280" text-anchor="middle">STYLE · STRUCTURE · COPY · BUILD · SHIP</text>
+            </g>
+            <g font-family="Unbounded, sans-serif" font-size="14" fill="#D4FF00" font-weight="700" letter-spacing="4">
+              <text x="330" y="380" text-anchor="middle">ONE PHRASE</text>
+            </g>
+          </g>
+
+          <!-- Right: ГОТОВО -->
+          <g>
+            <rect x="440" y="258" width="120" height="144" fill="none" stroke="#D4FF00" stroke-width="2.5"/>
+            <rect x="452" y="272" width="96" height="6" fill="#D4FF00" opacity="0.9"/>
+            <rect x="452" y="286" width="72" height="4" fill="rgba(212,255,0,0.5)"/>
+            <rect x="452" y="298" width="84" height="4" fill="rgba(212,255,0,0.4)"/>
+            <rect x="452" y="316" width="96" height="32" fill="rgba(212,255,0,0.18)"/>
+            <rect x="452" y="358" width="54" height="6" fill="#D4FF00"/>
+            <text x="500" y="240" text-anchor="middle" font-family="Space Mono, monospace" font-size="13" fill="rgba(245,245,242,0.55)" letter-spacing="4">OUTPUT · 02</text>
+            <text x="500" y="440" text-anchor="middle" font-family="Unbounded, sans-serif" font-weight="900" font-size="26" fill="#D4FF00" letter-spacing="-1">ГОТОВО</text>
+          </g>
+
+          <!-- Bottom meter -->
+          <g transform="translate(50, 540)">
+            <text x="0" y="-10" font-family="Space Mono, monospace" font-size="11" fill="rgba(245,245,242,0.5)" letter-spacing="2">T ≈ 30s · NO FIGMA · NO FREELANCER</text>
+            <line x1="0" y1="0" x2="500" y2="0" stroke="rgba(255,255,255,0.1)" stroke-width="1"/>
+            <line x1="0" y1="0" x2="500" y2="0" stroke="#D4FF00" stroke-width="2" stroke-dasharray="3 6"/>
+          </g>
+
+          <!-- corner marks -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.4)" letter-spacing="2">
+            <text x="14" y="16">PIPELINE.02</text>
+            <text x="586" y="16" text-anchor="end">AUTO</text>
+            <text x="14" y="656">INPUT → OUTPUT</text>
+            <text x="586" y="656" text-anchor="end">S2/08</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+
+    <div class="footer-line">
+      <span>S2 · AUTONOMY</span>
+      <span class="bar"></span>
+      <span>THOUGHT → SHIP</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 6 — SUPERPOWER 3 · АРХИТЕКТУРА СМЫСЛА
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide super" data-label="Архитектура смысла" style="--accent: var(--orange);">
+    <div class="chrome">
+      <div><span class="accent-dot" style="background: var(--orange); color: var(--orange);"></span><span class="section-label">СУПЕРСИЛА №3 · STRUCTURE</span></div>
+      <div class="page-num">06 / 12</div>
+    </div>
+
+    <div class="super-grid stagger">
+      <div>
+        <div class="super-num">Суперсила <b style="color: var(--orange);">№03</b> · <b style="color: var(--orange);">S3</b></div>
+        <h2>АРХИТЕКТ<span style="color: var(--orange); text-shadow: 0 0 40px rgba(255,107,26,0.5);">У</span>РА<br/>СМЫСЛА</h2>
+        <p class="body">
+          Не «Hero + Features + CTA». Смотрит кто твоя аудитория
+          и какая у&nbsp;неё осознанность. Холодный трафик получает
+          один лендинг. <b style="color: var(--orange);">Тёплый — совсем другой.</b>
+        </p>
+        <p class="subline">
+          → 22 фреймворка конверсии. 10 нишевых скелетов. Ни&nbsp;одного шаблона.
+        </p>
+      </div>
+
+      <div class="visual">
+        <svg viewBox="0 0 600 660" class="blueprint" preserveAspectRatio="xMidYMid meet">
+          <!-- Technical blueprint grid -->
+          <defs>
+            <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse">
+              <path d="M 30 0 L 0 0 0 30" fill="none" stroke="rgba(255,107,26,0.08)" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect x="0" y="0" width="600" height="660" fill="url(#grid)"/>
+
+          <!-- Three overlapping wireframe rectangles -->
+          <g stroke="#FF6B1A" stroke-width="1.5" fill="none">
+            <!-- Layer 1 -->
+            <rect x="80" y="110" width="300" height="180" stroke-dasharray="4 4"/>
+            <text x="88" y="128" font-family="Space Mono, monospace" font-size="10" fill="rgba(255,107,26,0.7)" letter-spacing="2">COLD · AWARENESS 01</text>
+            <!-- rows -->
+            <rect x="100" y="150" width="120" height="12" fill="#FF6B1A" opacity="0.8" stroke="none"/>
+            <rect x="100" y="172" width="80" height="6" fill="rgba(255,107,26,0.4)" stroke="none"/>
+            <rect x="100" y="200" width="240" height="60" fill="rgba(255,107,26,0.08)" stroke="rgba(255,107,26,0.3)"/>
+          </g>
+
+          <g stroke="#FF6B1A" stroke-width="2" fill="none">
+            <rect x="200" y="220" width="320" height="200"/>
+            <text x="208" y="240" font-family="Space Mono, monospace" font-size="10" fill="#FF6B1A" letter-spacing="2">WARM · AWARENESS 03</text>
+            <rect x="220" y="260" width="180" height="10" fill="#FF6B1A" stroke="none"/>
+            <rect x="220" y="276" width="140" height="6" fill="rgba(255,107,26,0.5)" stroke="none"/>
+            <rect x="220" y="300" width="280" height="80" fill="rgba(255,107,26,0.14)" stroke="rgba(255,107,26,0.5)"/>
+          </g>
+
+          <g stroke="rgba(255,107,26,0.45)" stroke-width="1" fill="none">
+            <rect x="140" y="360" width="260" height="180" stroke-dasharray="2 4"/>
+            <text x="148" y="378" font-family="Space Mono, monospace" font-size="10" fill="rgba(255,107,26,0.5)" letter-spacing="2">HOT · AWARENESS 05</text>
+          </g>
+
+          <!-- Dimension marks -->
+          <g stroke="rgba(245,245,242,0.25)" stroke-width="1" fill="rgba(245,245,242,0.55)" font-family="Space Mono, monospace" font-size="10" letter-spacing="1">
+            <line x1="40" y1="110" x2="40" y2="540"/>
+            <line x1="36" y1="110" x2="44" y2="110"/>
+            <line x1="36" y1="540" x2="44" y2="540"/>
+            <text x="30" y="335" text-anchor="middle" transform="rotate(-90 30 335)">22 FRAMEWORKS</text>
+
+            <line x1="80" y1="580" x2="520" y2="580"/>
+            <line x1="80" y1="576" x2="80" y2="584"/>
+            <line x1="520" y1="576" x2="520" y2="584"/>
+            <text x="300" y="600" text-anchor="middle">10 NICHE SKELETONS</text>
+          </g>
+
+          <!-- Corner marks -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.4)" letter-spacing="2">
+            <text x="14" y="16">STRUCTURE.03</text>
+            <text x="586" y="16" text-anchor="end">BLUEPRINT</text>
+            <text x="14" y="648">AUDIENCE · AWARENESS</text>
+            <text x="586" y="648" text-anchor="end">S3/08</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+
+    <div class="footer-line">
+      <span>S3 · MEANING ARCHITECTURE</span>
+      <span class="bar"></span>
+      <span>AUDIENCE → STRUCTURE</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 7 — SUPERPOWER 4 · ВКУС
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide super" data-label="Вкус" style="--accent: var(--cyan);">
+    <div class="chrome">
+      <div><span class="accent-dot" style="background: var(--cyan); color: var(--cyan);"></span><span class="section-label">СУПЕРСИЛА №4 · TASTE</span></div>
+      <div class="page-num">07 / 12</div>
+    </div>
+
+    <div class="super-grid stagger">
+      <div>
+        <div class="super-num">Суперсила <b style="color: var(--cyan);">№04</b> · <b style="color: var(--cyan);">S4</b></div>
+        <h2>ВК<span style="color: var(--cyan); text-shadow: 0 0 40px rgba(0,245,212,0.5);">У</span>С.</h2>
+        <p class="body">
+          Режет AI‑слоп ещё до того как что‑то создать.
+          Никаких стоковых улыбок. Никаких синих голограмм.
+          Никаких инновационных градиентов. <b style="color: var(--cyan);">Насмотренность встроена.</b>
+        </p>
+        <p class="subline">
+          → 11 запретов. Конкретные цвета. Точные шрифты.<br/>
+          &nbsp;&nbsp;&nbsp;Никаких «что‑то современное».
+        </p>
+      </div>
+
+      <div class="visual">
+        <svg viewBox="0 0 600 660" class="blueprint" preserveAspectRatio="xMidYMid meet">
+          <!-- 3x3 grid of thumbnails, all crossed out -->
+          <g>
+            <!-- row 1 -->
+            <g transform="translate(80, 90)">
+              <rect width="130" height="130" fill="rgba(245,245,242,0.04)" stroke="rgba(245,245,242,0.15)"/>
+              <circle cx="42" cy="58" r="14" fill="rgba(245,245,242,0.2)"/>
+              <rect x="70" y="76" width="44" height="6" fill="rgba(245,245,242,0.15)"/>
+              <rect x="16" y="100" width="96" height="14" fill="rgba(245,245,242,0.1)"/>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">STOCK SMILES</text>
+            </g>
+            <g transform="translate(235, 90)">
+              <rect width="130" height="130" fill="rgba(0,245,212,0.06)" stroke="rgba(0,245,212,0.25)"/>
+              <circle cx="65" cy="65" r="48" fill="rgba(0,245,212,0.18)" filter="blur(6px)"/>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">BLUE HOLOGRAM</text>
+            </g>
+            <g transform="translate(390, 90)">
+              <rect width="130" height="130" fill="rgba(245,245,242,0.04)" stroke="rgba(245,245,242,0.15)"/>
+              <path d="M0 130 L130 0 L130 60 L60 130 Z" fill="rgba(245,245,242,0.1)"/>
+              <path d="M0 90 L130 0 L130 20 L30 130 L0 130 Z" fill="rgba(245,245,242,0.06)"/>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">GRADIENT MESH</text>
+            </g>
+
+            <!-- row 2 -->
+            <g transform="translate(80, 250)">
+              <rect width="130" height="130" fill="rgba(245,245,242,0.04)" stroke="rgba(245,245,242,0.15)"/>
+              <!-- robot head -->
+              <rect x="40" y="36" width="50" height="50" fill="rgba(245,245,242,0.18)"/>
+              <rect x="48" y="48" width="10" height="10" fill="#0A0A0A"/>
+              <rect x="72" y="48" width="10" height="10" fill="#0A0A0A"/>
+              <rect x="55" y="72" width="20" height="4" fill="#0A0A0A"/>
+              <rect x="60" y="86" width="10" height="14" fill="rgba(245,245,242,0.18)"/>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">ROBOT CLIPART</text>
+            </g>
+            <g transform="translate(235, 250)">
+              <rect width="130" height="130" fill="rgba(245,245,242,0.04)" stroke="rgba(245,245,242,0.15)"/>
+              <!-- circuit board -->
+              <g stroke="rgba(245,245,242,0.18)" stroke-width="1" fill="none">
+                <path d="M10 30 L50 30 L50 70 L90 70 L90 30 L120 30"/>
+                <path d="M10 65 L30 65 L30 100 L100 100"/>
+                <path d="M20 110 L60 110 L60 80"/>
+                <circle cx="50" cy="30" r="3"/><circle cx="90" cy="70" r="3"/>
+                <circle cx="30" cy="65" r="3"/><circle cx="60" cy="110" r="3"/>
+              </g>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">CIRCUIT BOARD</text>
+            </g>
+            <g transform="translate(390, 250)">
+              <rect width="130" height="130" fill="rgba(245,245,242,0.04)" stroke="rgba(245,245,242,0.15)"/>
+              <!-- pastel 3-col -->
+              <rect x="10" y="30" width="32" height="80" fill="rgba(245,180,200,0.25)"/>
+              <rect x="50" y="30" width="32" height="80" fill="rgba(180,220,245,0.25)"/>
+              <rect x="90" y="30" width="32" height="80" fill="rgba(220,245,180,0.25)"/>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">PASTEL GRID</text>
+            </g>
+
+            <!-- row 3 -->
+            <g transform="translate(80, 410)">
+              <rect width="130" height="130" fill="rgba(245,245,242,0.04)" stroke="rgba(245,245,242,0.15)"/>
+              <!-- brain -->
+              <ellipse cx="65" cy="60" rx="40" ry="30" fill="rgba(245,245,242,0.15)"/>
+              <path d="M35 50 Q 50 35 65 50 T 95 50" fill="none" stroke="#0A0A0A" stroke-width="2"/>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">GLOWING BRAIN</text>
+            </g>
+            <g transform="translate(235, 410)">
+              <rect width="130" height="130" fill="rgba(245,245,242,0.04)" stroke="rgba(245,245,242,0.15)"/>
+              <!-- 3 emoji feature cards -->
+              <circle cx="28" cy="40" r="10" fill="rgba(255,107,26,0.35)"/>
+              <rect x="18" y="55" width="20" height="3" fill="rgba(245,245,242,0.25)"/>
+              <circle cx="65" cy="40" r="10" fill="rgba(0,245,212,0.35)"/>
+              <rect x="55" y="55" width="20" height="3" fill="rgba(245,245,242,0.25)"/>
+              <circle cx="102" cy="40" r="10" fill="rgba(255,46,147,0.35)"/>
+              <rect x="92" y="55" width="20" height="3" fill="rgba(245,245,242,0.25)"/>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">3‑COL EMOJI</text>
+            </g>
+            <g transform="translate(390, 410)">
+              <rect width="130" height="130" fill="rgba(245,245,242,0.04)" stroke="rgba(245,245,242,0.15)"/>
+              <text x="18" y="55" font-family="serif" font-style="italic" font-size="16" fill="rgba(245,245,242,0.45)">Seamless.</text>
+              <text x="18" y="80" font-family="serif" font-style="italic" font-size="16" fill="rgba(245,245,242,0.45)">Innovative.</text>
+              <text x="18" y="105" font-family="serif" font-style="italic" font-size="16" fill="rgba(245,245,242,0.45)">Cutting‑edge.</text>
+              <text x="65" y="148" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.35)" letter-spacing="2">BUZZWORDS</text>
+            </g>
+          </g>
+
+          <!-- big diagonal slash over the whole cluster -->
+          <g>
+            <line x1="60" y1="80" x2="540" y2="550" stroke="#00F5D4" stroke-width="6" opacity="0.95"/>
+            <line x1="540" y1="80" x2="60" y2="550" stroke="#F5F5F2" stroke-width="6" opacity="0.9"/>
+          </g>
+
+          <!-- Corner marks -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.4)" letter-spacing="2">
+            <text x="14" y="16">TASTE.04</text>
+            <text x="586" y="16" text-anchor="end">11 RULES</text>
+            <text x="14" y="648">AI SLOP · REJECTED</text>
+            <text x="586" y="648" text-anchor="end">S4/08</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+
+    <div class="footer-line">
+      <span>S4 · TASTE</span>
+      <span class="bar"></span>
+      <span>SLOP DETECTOR · ON</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 8 — SUPERPOWER 5 · САМОКРИТИКА
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide super" data-label="Самокритика" style="--accent: var(--magenta);">
+    <div class="chrome">
+      <div><span class="accent-dot"></span><span class="section-label">СУПЕРСИЛА №5 · SELF‑CRITIQUE</span></div>
+      <div class="page-num">08 / 12</div>
+    </div>
+
+    <div class="super-grid stagger">
+      <div>
+        <div class="super-num">Суперсила <b>№05</b> · <b>S5</b></div>
+        <h2>САМО<br/>КРИ<span style="color: var(--magenta); text-shadow: 0 0 40px rgba(255,46,147,0.5);">Т</span>ИКА.</h2>
+        <p class="body">
+          Критикует свою же работу <b style="color: var(--magenta);">до того</b> как отдать тебе.
+          Проходит по 11 паттернам провала. Выставляет оценку от&nbsp;A до&nbsp;F.
+          Если ниже B — переделывает. Ты&nbsp;получаешь только чистое.
+        </p>
+        <p class="subline">
+          → Design Score. AI Slop Score. Две буквы. Одна&nbsp;планка.
+        </p>
+      </div>
+
+      <div class="visual">
+        <svg viewBox="0 0 600 660" class="blueprint" preserveAspectRatio="xMidYMid meet">
+          <!-- Two big certificate-style rating badges, A letters -->
+
+          <!-- Badge 1 — Design Score -->
+          <g transform="translate(60, 130)">
+            <rect x="0" y="0" width="220" height="280" fill="none" stroke="#FF2E93" stroke-width="2"/>
+            <rect x="0" y="0" width="220" height="30" fill="#FF2E93"/>
+            <text x="110" y="22" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700" font-size="12" fill="#0A0A0A" letter-spacing="4">DESIGN SCORE</text>
+            <!-- A -->
+            <text x="110" y="202" text-anchor="middle" font-family="Unbounded, sans-serif" font-weight="900" font-size="200" fill="#FF2E93" letter-spacing="-8"
+              style="text-shadow: 0 0 30px rgba(255,46,147,0.6);">A</text>
+            <!-- separators -->
+            <line x1="20" y1="230" x2="200" y2="230" stroke="rgba(255,46,147,0.35)"/>
+            <text x="110" y="252" text-anchor="middle" font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.6)" letter-spacing="3">LAYOUT · TYPE · SYSTEM</text>
+            <text x="110" y="270" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.45)" letter-spacing="3">PASS · CERT №01</text>
+          </g>
+
+          <!-- Badge 2 — AI Slop Score -->
+          <g transform="translate(320, 240)">
+            <rect x="0" y="0" width="220" height="280" fill="none" stroke="#D4FF00" stroke-width="2"/>
+            <rect x="0" y="0" width="220" height="30" fill="#D4FF00"/>
+            <text x="110" y="22" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700" font-size="12" fill="#0A0A0A" letter-spacing="4">AI SLOP SCORE</text>
+            <text x="110" y="202" text-anchor="middle" font-family="Unbounded, sans-serif" font-weight="900" font-size="200" fill="#D4FF00" letter-spacing="-8"
+              style="text-shadow: 0 0 30px rgba(212,255,0,0.6);">A</text>
+            <line x1="20" y1="230" x2="200" y2="230" stroke="rgba(212,255,0,0.35)"/>
+            <text x="110" y="252" text-anchor="middle" font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.6)" letter-spacing="3">11 FAILURE PATTERNS</text>
+            <text x="110" y="270" text-anchor="middle" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.45)" letter-spacing="3">PASS · CERT №02</text>
+          </g>
+
+          <!-- thread connecting both -->
+          <line x1="280" y1="270" x2="320" y2="300" stroke="rgba(245,245,242,0.25)" stroke-dasharray="2 4"/>
+
+          <!-- grading scale -->
+          <g transform="translate(60, 560)" font-family="Space Mono, monospace" font-size="12" fill="rgba(245,245,242,0.55)" letter-spacing="4">
+            <text x="0" y="0">A · B</text>
+            <text x="140" y="0" fill="rgba(255,46,147,0.6)">│ PASS</text>
+            <text x="300" y="0">C · D · F</text>
+            <text x="460" y="0" fill="rgba(245,245,242,0.3)">│ REDO</text>
+          </g>
+          <line x1="60" y1="575" x2="540" y2="575" stroke="rgba(245,245,242,0.12)"/>
+
+          <!-- Corner marks -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.4)" letter-spacing="2">
+            <text x="14" y="16">SELFCRIT.05</text>
+            <text x="586" y="16" text-anchor="end">A/F</text>
+            <text x="14" y="648">11 FAILURE PATTERNS</text>
+            <text x="586" y="648" text-anchor="end">S5/08</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+
+    <div class="footer-line">
+      <span>S5 · SELF‑CRITIQUE</span>
+      <span class="bar"></span>
+      <span>BELOW B · REDO</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 9 — SUPERPOWER 6 · РЕФЕРЕНС‑МАГИЯ
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide super" data-label="Референс‑магия" style="--accent: var(--orange);">
+    <div class="chrome">
+      <div><span class="accent-dot" style="background: var(--orange); color: var(--orange);"></span><span class="section-label">СУПЕРСИЛА №6 · REFERENCES</span></div>
+      <div class="page-num">09 / 12</div>
+    </div>
+
+    <div class="super-grid stagger">
+      <div>
+        <div class="super-num">Суперсила <b style="color: var(--orange);">№06</b> · <b style="color: var(--orange);">S6</b></div>
+        <h2>РЕФЕ<span style="color: var(--orange); text-shadow: 0 0 40px rgba(255,107,26,0.5);">Р</span>ЕНС‑<br/>МАГИЯ.</h2>
+        <p class="body">
+          «Хочу как большой бренд» — забирает ДНК за&nbsp;секунды.
+          «Вот сайт, который мне нравится» — вытаскивает его
+          палитру, шрифты, отступы — <b style="color: var(--orange);">одной командой.</b>
+        </p>
+        <p class="subline">
+          → 70 эталонных стилей в&nbsp;голове. И&nbsp;любой сайт мира — материал.
+        </p>
+      </div>
+
+      <div class="visual">
+        <svg viewBox="0 0 600 660" class="blueprint" preserveAspectRatio="xMidYMid meet">
+          <!-- 3×3 grid of abstract geometric tiles -->
+          <g>
+            <!-- Row 1 -->
+            <g transform="translate(30, 90)">
+              <rect width="170" height="170" fill="#FF6B1A"/>
+              <circle cx="85" cy="85" r="50" fill="#0A0A0A"/>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="#0A0A0A" letter-spacing="2">REF · 01</text>
+            </g>
+            <g transform="translate(215, 90)">
+              <rect width="170" height="170" fill="#0A0A0A" stroke="#F5F5F2" stroke-width="1"/>
+              <rect x="40" y="40" width="90" height="90" fill="#F5F5F2"/>
+              <rect x="55" y="55" width="60" height="60" fill="#0A0A0A"/>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.55)" letter-spacing="2">REF · 02</text>
+            </g>
+            <g transform="translate(400, 90)">
+              <rect width="170" height="170" fill="#00F5D4"/>
+              <path d="M 30 140 L 85 30 L 140 140 Z" fill="#0A0A0A"/>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="#0A0A0A" letter-spacing="2">REF · 03</text>
+            </g>
+
+            <!-- Row 2 -->
+            <g transform="translate(30, 275)">
+              <rect width="170" height="170" fill="#D4FF00"/>
+              <rect x="20" y="70" width="130" height="30" rx="15" fill="#0A0A0A"/>
+              <rect x="20" y="110" width="80" height="30" rx="15" fill="#0A0A0A"/>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="#0A0A0A" letter-spacing="2">REF · 04</text>
+            </g>
+            <g transform="translate(215, 275)">
+              <rect width="170" height="170" fill="#FF2E93"/>
+              <circle cx="52" cy="52" r="28" fill="#0A0A0A"/>
+              <circle cx="118" cy="52" r="28" fill="#0A0A0A"/>
+              <circle cx="85" cy="120" r="28" fill="#0A0A0A"/>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="#0A0A0A" letter-spacing="2">REF · 05</text>
+            </g>
+            <g transform="translate(400, 275)">
+              <rect width="170" height="170" fill="#F5F5F2"/>
+              <!-- abstract wave bars -->
+              <rect x="22" y="30" width="6" height="110" fill="#0A0A0A"/>
+              <rect x="38" y="50" width="6" height="90" fill="#0A0A0A"/>
+              <rect x="54" y="70" width="6" height="70" fill="#0A0A0A"/>
+              <rect x="70" y="40" width="6" height="100" fill="#0A0A0A"/>
+              <rect x="86" y="60" width="6" height="80" fill="#0A0A0A"/>
+              <rect x="102" y="20" width="6" height="120" fill="#0A0A0A"/>
+              <rect x="118" y="50" width="6" height="90" fill="#0A0A0A"/>
+              <rect x="134" y="80" width="6" height="60" fill="#0A0A0A"/>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="#0A0A0A" letter-spacing="2">REF · 06</text>
+            </g>
+
+            <!-- Row 3 -->
+            <g transform="translate(30, 460)">
+              <rect width="170" height="170" fill="#0A0A0A" stroke="#FF6B1A" stroke-width="2"/>
+              <circle cx="85" cy="85" r="50" fill="none" stroke="#FF6B1A" stroke-width="2"/>
+              <circle cx="85" cy="85" r="30" fill="#FF6B1A"/>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="#FF6B1A" letter-spacing="2">REF · 07</text>
+            </g>
+            <g transform="translate(215, 460)">
+              <rect width="170" height="170" fill="#FF2E17"/>
+              <rect x="40" y="50" width="90" height="6" fill="#F5F5F2"/>
+              <rect x="40" y="66" width="90" height="6" fill="#F5F5F2"/>
+              <rect x="40" y="82" width="60" height="6" fill="#F5F5F2"/>
+              <rect x="40" y="105" width="40" height="20" fill="#F5F5F2"/>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="#F5F5F2" letter-spacing="2">REF · 08</text>
+            </g>
+            <g transform="translate(400, 460)">
+              <rect width="170" height="170" fill="#0A0A0A" stroke="#F5F5F2" stroke-width="1"/>
+              <text x="85" y="125" text-anchor="middle" font-family="Unbounded, sans-serif" font-weight="900" font-size="140" fill="#F5F5F2" letter-spacing="-8">+</text>
+              <text x="14" y="160" font-family="Space Mono, monospace" font-size="9" fill="rgba(245,245,242,0.6)" letter-spacing="2">+ ∞ MORE</text>
+            </g>
+          </g>
+
+          <!-- Corner marks -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.4)" letter-spacing="2">
+            <text x="14" y="16">REFS.06</text>
+            <text x="586" y="16" text-anchor="end">70 + ∞</text>
+            <text x="14" y="648">DNA EXTRACTION</text>
+            <text x="586" y="648" text-anchor="end">S6/08</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+
+    <div class="footer-line">
+      <span>S6 · REFERENCE MAGIC</span>
+      <span class="bar"></span>
+      <span>70 DNA KITS</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 10 — SUPERPOWER 7 · НЕ ТОЛЬКО ЛЕНДИНГ
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide super" data-label="Не только лендинг" style="--accent: var(--lime);">
+    <div class="chrome">
+      <div><span class="accent-dot" style="background: var(--lime); color: var(--lime);"></span><span class="section-label">СУПЕРСИЛА №7 · ARSENAL</span></div>
+      <div class="page-num">10 / 12</div>
+    </div>
+
+    <div class="stagger" style="display: flex; flex-direction: column; flex: 1; margin-top: 40px;">
+      <div class="super-num">Суперсила <b style="color: var(--lime);">№07</b> · <b style="color: var(--lime);">S7</b></div>
+      <h2 style="font-family: 'Unbounded', sans-serif; font-weight: 900; font-size: 140px; line-height: 0.85; letter-spacing: -0.05em; margin: 0 0 48px;">
+        НЕ ТОЛЬКО <span style="color: var(--lime); text-shadow: 0 0 40px rgba(212,255,0,0.5);">ЛЕНДИНГ.</span>
+      </h2>
+
+      <!-- 2-col below: left description, right 2x5 arsenal grid -->
+      <div style="display: grid; grid-template-columns: 1fr 1.3fr; gap: 80px; align-items: stretch; flex: 1; min-height: 0;">
+        <div style="display: flex; flex-direction: column; justify-content: flex-end;">
+          <p style="font-family: 'Space Grotesk', sans-serif; font-weight: 400; font-size: 30px; line-height: 1.25; color: var(--ink); max-width: 540px; letter-spacing: -0.01em;">
+            Лендинг. Дашборд. Презентация. Обложка канала.
+            Инфографика для постов. One‑pager. Коммерческое.
+            Мокап приложения. Email‑письмо. Карточки в соцсети.
+          </p>
+          <p class="subline" style="max-width: 540px;">
+            → 10 типов. Один помощник. В&nbsp;твоём&nbsp;стиле.
+          </p>
+        </div>
+
+        <!-- Arsenal 2×5 -->
+        <div style="display: grid; grid-template-columns: repeat(5, 1fr); grid-template-rows: repeat(2, 1fr); gap: 12px;">
+
+          <div class="arsenal-cell" style="border:1px solid rgba(212,255,0,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(212,255,0,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #D4FF00; letter-spacing: 2px;">01</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="4" y="4" width="72" height="10" fill="#D4FF00"/><rect x="4" y="20" width="50" height="4" fill="rgba(245,245,242,0.55)"/><rect x="4" y="28" width="60" height="28" fill="rgba(212,255,0,0.15)" stroke="rgba(212,255,0,0.4)"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 15px; letter-spacing: -0.01em;">ЛЕНДИНГ</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(255,46,147,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(255,46,147,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #FF2E93; letter-spacing: 2px;">02</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="4" y="4" width="20" height="18" fill="#FF2E93"/><rect x="28" y="4" width="48" height="18" fill="rgba(255,46,147,0.25)" stroke="rgba(255,46,147,0.5)"/><rect x="4" y="26" width="72" height="30" fill="none" stroke="rgba(255,46,147,0.4)"/><polyline points="8,52 20,38 32,45 48,30 60,40 72,32" fill="none" stroke="#FF2E93" stroke-width="1.5"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 15px; letter-spacing: -0.01em;">ДАШБОРД</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(0,245,212,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(0,245,212,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #00F5D4; letter-spacing: 2px;">03</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="4" y="8" width="72" height="44" fill="rgba(0,245,212,0.1)" stroke="#00F5D4"/><rect x="10" y="18" width="40" height="5" fill="#00F5D4"/><rect x="10" y="28" width="30" height="3" fill="rgba(245,245,242,0.5)"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 15px; letter-spacing: -0.01em;">СЛАЙДЫ</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(255,107,26,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(255,107,26,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #FF6B1A; letter-spacing: 2px;">04</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="8" y="8" width="64" height="44" fill="#FF6B1A"/><rect x="14" y="14" width="52" height="4" fill="#0A0A0A"/><rect x="14" y="22" width="40" height="4" fill="#0A0A0A"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 14px; letter-spacing: -0.01em;">ОБЛОЖКА</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(212,255,0,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(212,255,0,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #D4FF00; letter-spacing: 2px;">05</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><circle cx="40" cy="30" r="20" fill="none" stroke="#D4FF00" stroke-width="2"/><path d="M40 10 L40 50 M20 30 L60 30" stroke="#D4FF00" stroke-width="1.5"/><text x="40" y="34" text-anchor="middle" font-family="Space Mono, monospace" font-size="10" font-weight="700" fill="#D4FF00">42%</text></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 13px; letter-spacing: -0.01em;">ИНФОГРАФИКА</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(0,245,212,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(0,245,212,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #00F5D4; letter-spacing: 2px;">06</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="4" y="4" width="72" height="52" fill="none" stroke="#00F5D4"/><rect x="10" y="10" width="20" height="4" fill="#00F5D4"/><rect x="10" y="18" width="60" height="2" fill="rgba(245,245,242,0.4)"/><rect x="10" y="24" width="40" height="2" fill="rgba(245,245,242,0.4)"/><rect x="10" y="32" width="50" height="2" fill="rgba(245,245,242,0.4)"/><rect x="10" y="40" width="25" height="8" fill="#00F5D4"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 14px; letter-spacing: -0.01em;">ONE‑PAGER</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(255,46,23,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(255,46,23,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #FF2E17; letter-spacing: 2px;">07</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="4" y="4" width="72" height="52" fill="rgba(255,46,23,0.1)" stroke="#FF2E17"/><text x="40" y="26" text-anchor="middle" font-family="Unbounded, sans-serif" font-size="11" font-weight="900" fill="#FF2E17">₽</text><rect x="14" y="32" width="52" height="2" fill="rgba(245,245,242,0.5)"/><rect x="14" y="38" width="40" height="2" fill="rgba(245,245,242,0.5)"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 13px; letter-spacing: -0.01em;">КОММЕРЧ.</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(255,46,147,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(255,46,147,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #FF2E93; letter-spacing: 2px;">08</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="26" y="4" width="28" height="52" rx="4" fill="none" stroke="#FF2E93" stroke-width="1.5"/><rect x="30" y="10" width="20" height="30" fill="rgba(255,46,147,0.2)"/><circle cx="40" cy="50" r="2" fill="#FF2E93"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 14px; letter-spacing: -0.01em;">МОКАП</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(212,255,0,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(212,255,0,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #D4FF00; letter-spacing: 2px;">09</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="4" y="10" width="72" height="44" fill="none" stroke="#D4FF00"/><path d="M4 10 L40 36 L76 10" fill="none" stroke="#D4FF00" stroke-width="1.5"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 15px; letter-spacing: -0.01em;">EMAIL</div>
+          </div>
+
+          <div class="arsenal-cell" style="border:1px solid rgba(0,245,212,0.4); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(0,245,212,0.04);">
+            <div style="font-family: 'Space Mono', monospace; font-size: 11px; color: #00F5D4; letter-spacing: 2px;">10</div>
+            <svg viewBox="0 0 80 60" style="width: 100%; height: 50%;"><rect x="6" y="6" width="30" height="48" fill="rgba(0,245,212,0.15)" stroke="#00F5D4"/><rect x="42" y="6" width="30" height="48" fill="#00F5D4"/></svg>
+            <div style="font-family: 'Unbounded', sans-serif; font-weight: 700; font-size: 13px; letter-spacing: -0.01em;">СОЦСЕТИ</div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-line">
+      <span>S7 · ARSENAL · 10 FORMATS</span>
+      <span class="bar"></span>
+      <span>ONE STYLE · ALL OUTPUTS</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 11 — SUPERPOWER 8 · ЖИВАЯ ПАМЯТЬ
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide super" data-label="Живая память" style="--accent: var(--cyan);">
+    <div class="chrome">
+      <div><span class="accent-dot" style="background: var(--cyan); color: var(--cyan);"></span><span class="section-label">СУПЕРСИЛА №8 · LIVE MEMORY</span></div>
+      <div class="page-num">11 / 12</div>
+    </div>
+
+    <div class="super-grid stagger">
+      <div>
+        <div class="super-num">Суперсила <b style="color: var(--cyan);">№08</b> · <b style="color: var(--cyan);">S8</b></div>
+        <h2>ЖИВАЯ<br/>ПАМ<span style="color: var(--cyan); text-shadow: 0 0 40px rgba(0,245,212,0.5);">Я</span>ТЬ.</h2>
+        <p class="body">
+          Запоминает что тебе зашло, что ты&nbsp;отверг. Какие цвета любишь, какие бесят.
+          Какие правки делаешь постоянно. На&nbsp;втором дизайне&nbsp;— знает тебя.
+          <b style="color: var(--cyan);">На десятом — знает лучше фрилансера</b>, который работал с&nbsp;тобой год.
+        </p>
+        <p class="subline">
+          → «Замени охру на&nbsp;терракот.» Помнит историю. Никогда не&nbsp;переделывает с&nbsp;нуля.
+        </p>
+      </div>
+
+      <div class="visual">
+        <svg viewBox="0 0 600 660" class="blueprint" preserveAspectRatio="xMidYMid meet">
+          <!-- Sedimentary rock — layered translucent stratas -->
+          <defs>
+            <clipPath id="crop">
+              <rect x="40" y="80" width="520" height="480"/>
+            </clipPath>
+          </defs>
+
+          <g clip-path="url(#crop)">
+            <!-- Layer 1 — oldest at bottom -->
+            <path d="M40 540 Q 300 500 560 540 L 560 560 L 40 560 Z" fill="rgba(0,245,212,0.12)" stroke="rgba(0,245,212,0.35)" stroke-width="1"/>
+            <path d="M40 490 Q 300 460 560 490 L 560 540 L 40 540 Z" fill="rgba(0,245,212,0.16)" stroke="rgba(0,245,212,0.4)" stroke-width="1"/>
+            <path d="M40 430 Q 300 410 560 440 L 560 490 L 40 490 Z" fill="rgba(0,245,212,0.22)" stroke="rgba(0,245,212,0.5)" stroke-width="1"/>
+            <path d="M40 380 Q 300 350 560 380 L 560 440 L 40 430 Z" fill="rgba(0,245,212,0.28)" stroke="rgba(0,245,212,0.55)" stroke-width="1"/>
+            <path d="M40 320 Q 300 300 560 330 L 560 380 L 40 380 Z" fill="rgba(0,245,212,0.36)" stroke="rgba(0,245,212,0.6)" stroke-width="1"/>
+            <path d="M40 260 Q 300 240 560 270 L 560 330 L 40 320 Z" fill="rgba(0,245,212,0.48)" stroke="rgba(0,245,212,0.75)" stroke-width="1"/>
+            <path d="M40 200 Q 300 180 560 210 L 560 270 L 40 260 Z" fill="rgba(0,245,212,0.6)" stroke="rgba(0,245,212,0.9)" stroke-width="1"/>
+            <path d="M40 140 Q 300 120 560 150 L 560 210 L 40 200 Z" fill="rgba(0,245,212,0.78)" stroke="#00F5D4" stroke-width="1.5"/>
+          </g>
+
+          <!-- Timeline axis -->
+          <g stroke="rgba(245,245,242,0.3)" stroke-width="1">
+            <line x1="40" y1="80" x2="40" y2="580"/>
+            <line x1="36" y1="80" x2="44" y2="80"/>
+            <line x1="36" y1="580" x2="44" y2="580"/>
+          </g>
+
+          <!-- Axis labels -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.55)" letter-spacing="2">
+            <text x="20" y="86" text-anchor="end">TODAY</text>
+            <text x="20" y="584" text-anchor="end">DAY 01</text>
+          </g>
+
+          <!-- Layer annotations -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="#0A0A0A" letter-spacing="2">
+            <text x="70" y="178">DESIGN 10 · KNOWS YOU BETTER</text>
+            <text x="70" y="238">DESIGN 07</text>
+            <text x="70" y="298">DESIGN 05</text>
+          </g>
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.6)" letter-spacing="2">
+            <text x="70" y="358">DESIGN 03</text>
+            <text x="70" y="418">DESIGN 02 · FIRST PATTERN</text>
+            <text x="70" y="478">DESIGN 01 · BASELINE</text>
+          </g>
+
+          <!-- A marker line showing "replace ochre with terracotta" -->
+          <g>
+            <line x1="440" y1="80" x2="440" y2="580" stroke="#FF6B1A" stroke-width="1" stroke-dasharray="3 4"/>
+            <circle cx="440" cy="330" r="6" fill="#FF6B1A"/>
+            <text x="450" y="326" font-family="Space Mono, monospace" font-size="10" fill="#FF6B1A" letter-spacing="2">EDIT · ONE PHRASE</text>
+            <text x="450" y="342" font-family="Space Mono, monospace" font-size="9" fill="rgba(255,107,26,0.7)" letter-spacing="1">OCHRE → TERRACOTTA</text>
+          </g>
+
+          <!-- Corner marks -->
+          <g font-family="Space Mono, monospace" font-size="10" fill="rgba(245,245,242,0.4)" letter-spacing="2">
+            <text x="14" y="16">MEMORY.08</text>
+            <text x="586" y="16" text-anchor="end">LAYERED</text>
+            <text x="14" y="648">DEPTH OVER TIME</text>
+            <text x="586" y="648" text-anchor="end">S8/08</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+
+    <div class="footer-line">
+      <span>S8 · LIVE MEMORY</span>
+      <span class="bar"></span>
+      <span>LAYERED · ACCUMULATIVE</span>
+    </div>
+  </section>
+
+
+  <!-- ═══════════════════════════════════════════════════════════
+       SLIDE 12 — FINAL
+       ═══════════════════════════════════════════════════════════ -->
+  <section class="slide final" data-label="Финал">
+    <!-- Single bottom-left glow -->
+    <div style="position: absolute; left: -10%; bottom: -30%; width: 60%; height: 60%; background: radial-gradient(ellipse at center, rgba(0,245,212,0.12) 0%, transparent 70%); pointer-events: none; z-index: 1;"></div>
+
+    <div class="agent-mark stagger">
+      ДИЗАЙНЕР<br/>
+      <b>AGENT v1.0 · LIVE</b>
+    </div>
+
+    <div class="final-inner stagger">
+      <div class="l1">Одна команда.</div>
+      <div class="l2">Установи Дизайнера.</div>
+      <div class="l3">
+        <span>И он в твоей команде.</span>
+        <span class="live-dot"></span>
+      </div>
+    </div>
+
+    <div class="tiny stagger">
+      <span>30 секунд.</span> &nbsp;·&nbsp;
+      <span>Без терминала.</span> &nbsp;·&nbsp;
+      <span>Без установок.</span> &nbsp;·&nbsp;
+      <span>Без фрилансера.</span>
+    </div>
+  </section>
+
+</deck-stage>
+
+<!-- ─────────────── Tweaks panel ─────────────── -->
+<script>
+(() => {
+  const state = { ...TWEAK_DEFAULTS };
+  let panel = null;
+
+  function applyAll() {
+    const root = document.documentElement;
+    // intensity 1..10 → grain 0.01 .. 0.18
+    const grain = 0.01 + (state.intensity / 10) * 0.17;
+    root.style.setProperty('--grain-opacity', grain.toFixed(3));
+
+    root.style.setProperty('--paper', state.paper || '#0A0A0A');
+    root.style.setProperty('--red', state.accent || '#FF2E17');
+
+    // caps toggle
+    if (state.caps) document.body.classList.add('all-caps');
+    else document.body.classList.remove('all-caps');
+
+    // shake → affect particle field drift speed
+    const pf = document.querySelector('.particle-field g');
+    if (pf) pf.style.animationDuration = state.shake ? '5s' : '14s';
+  }
+
+  const capsStyle = document.createElement('style');
+  capsStyle.textContent = `body.all-caps h1, body.all-caps h2, body.all-caps .subtitle, body.all-caps .bottom-line, body.all-caps .l1, body.all-caps .l2, body.all-caps .l3, body.all-caps .row-text, body.all-caps .body, body.all-caps .kicker { text-transform: uppercase; }`;
+  document.head.appendChild(capsStyle);
+
+  function buildPanel() {
+    if (panel) return;
+    panel = document.createElement('div');
+    panel.id = 'tweaks-panel';
+    panel.style.cssText = `
+      position: fixed; right: 24px; bottom: 80px;
+      width: 280px;
+      background: rgba(10,10,10,0.92);
+      border: 1px solid rgba(255,255,255,0.18);
+      color: #F5F5F2;
+      font-family: "Space Mono", ui-monospace, monospace;
+      font-size: 12px;
+      padding: 16px;
+      z-index: 2147483600;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+      backdrop-filter: blur(12px);
+      display: none;
+    `;
+    panel.innerHTML = `
+      <div style="font-weight:700; letter-spacing:0.24em; font-size:11px; color:#FF2E93; margin-bottom:16px;">TWEAKS · ДИЗАЙНЕР</div>
+
+      <label style="display:block; margin-bottom:14px;">
+        <div style="opacity:0.7; margin-bottom:6px;">GRAIN INTENSITY</div>
+        <input id="tw-intensity" type="range" min="0" max="10" step="1" style="width:100%;"/>
+        <span id="tw-intensity-val" style="opacity:0.6;"></span>
+      </label>
+
+      <label style="display:flex; align-items:center; gap:8px; margin-bottom:14px;">
+        <input id="tw-shake" type="checkbox"/>
+        <span>PARTICLE DRIFT (shake)</span>
+      </label>
+
+      <label style="display:flex; align-items:center; gap:8px; margin-bottom:14px;">
+        <input id="tw-caps" type="checkbox"/>
+        <span>ALL CAPS MODE</span>
+      </label>
+
+      <label style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
+        <span style="opacity:0.7;">RED ACCENT</span>
+        <input id="tw-accent" type="color" style="width:44px;height:28px;border:0;background:transparent;"/>
+      </label>
+
+      <label style="display:flex; align-items:center; justify-content:space-between;">
+        <span style="opacity:0.7;">PAPER (BG)</span>
+        <input id="tw-paper" type="color" style="width:44px;height:28px;border:0;background:transparent;"/>
+      </label>
+    `;
+    document.body.appendChild(panel);
+
+    const $ = (s) => panel.querySelector(s);
+    $('#tw-intensity').value = state.intensity;
+    $('#tw-intensity-val').textContent = state.intensity;
+    $('#tw-shake').checked = !!state.shake;
+    $('#tw-caps').checked = !!state.caps;
+    $('#tw-accent').value = state.accent;
+    $('#tw-paper').value = state.paper;
+
+    const persist = (edits) => {
+      Object.assign(state, edits);
+      applyAll();
+      try { window.parent.postMessage({ type: '__edit_mode_set_keys', edits }, '*'); } catch(e){}
+    };
+
+    $('#tw-intensity').addEventListener('input', (e) => {
+      $('#tw-intensity-val').textContent = e.target.value;
+      persist({ intensity: parseInt(e.target.value, 10) });
+    });
+    $('#tw-shake').addEventListener('change', (e) => persist({ shake: e.target.checked }));
+    $('#tw-caps').addEventListener('change', (e) => persist({ caps: e.target.checked }));
+    $('#tw-accent').addEventListener('input', (e) => persist({ accent: e.target.value }));
+    $('#tw-paper').addEventListener('input', (e) => persist({ paper: e.target.value }));
+  }
+
+  window.addEventListener('message', (e) => {
+    const d = e.data;
+    if (!d || !d.type) return;
+    if (d.type === '__activate_edit_mode') {
+      buildPanel();
+      panel.style.display = 'block';
+    } else if (d.type === '__deactivate_edit_mode') {
+      if (panel) panel.style.display = 'none';
+    }
+  });
+
+  applyAll();
+  try { window.parent.postMessage({ type: '__edit_mode_available' }, '*'); } catch(e){}
+})();
+</script>
+
+<script>
+(async () => {
+  try { await customElements.whenDefined('deck-stage'); } catch (e) {}
+  try { await document.fonts.ready; } catch (e) {}
+  setTimeout(() => { try { window.print(); } catch (e) {} }, 500);
+})();
+</script>
+</body>
+</html>

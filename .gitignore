@@ -1,0 +1,48 @@
+# === Системные ===
+.env
+.DS_Store
+node_modules/
+.claude/agent-memory*
+
+# === Локальные бэкапы ===
+.local-backup-*/
+
+# === Личные данные проектов ===
+# Клиент создаёт свои проекты сам через /new-project — папки <slug> не должны
+# попадать в template. В git только шаблоны и пример.
+projects/*
+!projects/_template
+!projects/_template-audience
+!projects/_example-project
+!projects/README.md
+!projects/.gitkeep
+
+# === Личные брендбуки ===
+# Клиенты собирают свои бренд-материалы через скилл brand-onboarding
+# в knowledge/brand/<project>/. В git template — только README.
+knowledge/brand/*
+!knowledge/brand/README.md
+!knowledge/brand/_template/
+!knowledge/brand/designer-deck/
+
+# === Личный inbox ===
+# Клиент кидает свои документы в inbox/docs/, делает свой prework.md.
+# В git только README с инструкцией.
+inbox/docs/*
+!inbox/docs/README.md
+inbox/prework.md
+inbox/_processed/*
+!inbox/_processed/.gitkeep
+inbox/_raw/*
+!inbox/_raw/.gitkeep
+inbox/_new/*
+!inbox/_new/.gitkeep
+
+# === Рабочие планы и черновики ===
+# Если кто-то наработает план в _planning/ — он не попадает в template
+_planning/
+
+# === Артефакты сессий Алекса ===
+# Memory/failures/state — пишутся самим Алексом во время работы.
+# В template они должны быть пустыми шаблонами, при работе клиент их наполняет.
+# Не игнорируем — но при первой установке Алекс заполняет из шаблонов.
